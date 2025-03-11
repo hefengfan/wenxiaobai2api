@@ -5,7 +5,7 @@ import uuid
 import datetime
 import time
 import re
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any, AsyncGenerator
@@ -248,196 +248,21 @@ def clean_thinking_content(content: str) -> str:
     return content
 
 
-async def process_response_stream(response: httpx.Response) -> AsyncGenerator[str, None]:
-    """处理流式响应"""
-    is_first_chunk = True
-    current_event = None  # 用于跟踪当前事件类型
-    buffer = ""  # 用于缓存内容
-    in_thinking_block = False  # 标记是否在思考块内
-    thinking_content = []  # 收集思考内容
-    thinking_started = False  # 标记是否已经开始思考块
+# 辅助函数：验证 API 密钥
+async def verify_api_key(authorization: str = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing API key")
 
-    async for line in response.aiter_lines():
-        line = line.strip()
-        if not line:
-            current_event = None  # 遇到空行重置事件类型
-            continue
-
-        # 解析事件类型
-        if line.startswith("event:"):
-            current_event = line[len("event:"):].strip()
-            continue
-
-        # 处理数据行
-        elif line.startswith("data:"):
-            json_str = line[len("data:"):].strip()
-            try:
-                data = json.loads(json_str)
-
-                # 处理消息事件
-                if current_event == "message":
-                    content = data.get("content", "")
-                    timestamp = data.get("timestamp", "")
-                    created = int(timestamp) // 1000 if timestamp else int(time.time())
-                    sse_id = data.get('sseId', str(uuid.uuid4()))
-
-                    # 检查是否是思考块的开始
-                    if "```ys_think" in content and not thinking_started:
-                        thinking_started = True
-                        in_thinking_block = True
-                        # 发送思考块开始标记
-                        start_chunk = {
-                            "id": f"chatcmpl-{sse_id}",
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": Config.DEFAULT_MODEL,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {
-                                    "content": "<think>\n\n" if not is_first_chunk else {
-                                        "role": "assistant",
-                                        "content": "<think>\n\n"
-                                    }
-                                },
-                                "finish_reason": None
-                            }]
-                        }
-                        is_first_chunk = False
-                        yield f"data: {json.dumps(start_chunk, ensure_ascii=False)}\n\n"
-                        continue
-
-                    # 检查是否是思考块的结束
-                    if "```" in content and in_thinking_block:
-                        in_thinking_block = False
-                        # 发送思考块结束标记
-                        end_chunk = {
-                            "id": f"chatcmpl-{sse_id}",
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": Config.DEFAULT_MODEL,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {
-                                    "content": "\n</think>\n\n"
-                                },
-                                "finish_reason": None
-                            }]
-                        }
-                        yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
-                        continue
-
-                    # 如果在思考块内，收集思考内容
-                    if in_thinking_block:
-                        thinking_content.append(content)
-                        # 在思考块内也发送内容，但标记为思考内容
-                        chunk = {
-                            "id": f"chatcmpl-{sse_id}",
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": Config.DEFAULT_MODEL,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {
-                                    "content": content
-                                },
-                                "finish_reason": None
-                            }]
-                        }
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                        continue
-
-                    # 清理内容，移除思考块
-                    content = clean_thinking_content(content)
-                    if not content:  # 如果清理后内容为空，跳过
-                        continue
-
-                    # 正常发送内容
-                    chunk = {
-                        "id": f"chatcmpl-{sse_id}",
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": Config.DEFAULT_MODEL,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {
-                                "content": content
-                            } if not is_first_chunk else {
-                                "role": "assistant",
-                                "content": content
-                            },
-                            "finish_reason": None
-                        }]
-                    }
-                    is_first_chunk = False
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    await asyncio.sleep(0.01)  # 减少延迟，提高响应速度
-
-                # 处理生成结束事件
-                elif current_event == "generateEnd":
-                    timestamp = data.get("timestamp", "")
-                    created = int(timestamp) // 1000 if timestamp else int(time.time())
-                    sse_id = data.get('sseId', str(uuid.uuid4()))
-
-                    # 如果思考块还没有结束，发送结束标记
-                    if in_thinking_block:
-                        end_thinking_chunk = {
-                            "id": f"chatcmpl-{sse_id}",
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": Config.DEFAULT_MODEL,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {
-                                    "content": "\n</think>\n\n"
-                                },
-                                "finish_reason": None
-                            }]
-                        }
-                        yield f"data: {json.dumps(end_thinking_chunk, ensure_ascii=False)}\n\n"
-                        in_thinking_block = False
-
-                    # 添加元数据
-                    meta_chunk = {
-                        "id": f"chatcmpl-{sse_id}",
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": Config.DEFAULT_MODEL,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {
-                                "meta": {
-                                    "thinking_content": "".join(thinking_content) if thinking_content else None
-                                }
-                            },
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(meta_chunk, ensure_ascii=False)}\n\n"
-
-                    # 发送结束标记
-                    end_chunk = {
-                        "id": f"chatcmpl-{sse_id}",
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": Config.DEFAULT_MODEL,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop"
-                        }]
-                    }
-                    yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
-                    yield "data: [DONE]\n\n"
-
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON解析错误: {e}")
-                continue
+    api_key = authorization.replace("Bearer ", "").strip()
+    if api_key != Config.API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return api_key
 
 
 async def generate_response(messages: List[dict], model: str, temperature: float, stream: bool,
                             max_tokens: Optional[int] = None, presence_penalty: float = 0,
                             frequency_penalty: float = 0, top_p: float = 1.0):
-    """生成响应"""
+    """生成响应 - 使用真正的流式处理"""
     # 确保会话已初始化
     await session_manager.refresh_if_needed()
 
@@ -516,16 +341,194 @@ async def generate_response(messages: List[dict], model: str, temperature: float
     }
 
     try:
+        # 使用 stream=True 参数，实现真正的流式处理
         async with httpx.AsyncClient(timeout=httpx.Timeout(900)) as client:
-            response = await client.post(
-                f"{Config.BASE_URL}/core/conversation/chat/v1",
-                headers=headers,
-                content=data
-            )
-            response.raise_for_status()
+            async with client.stream('POST', f"{Config.BASE_URL}/core/conversation/chat/v1",
+                                     headers=headers, content=data) as response:
+                response.raise_for_status()
 
-            async for chunk in process_response_stream(response):
-                yield chunk
+                # 处理流式响应
+                is_first_chunk = True
+                current_event = None
+                in_thinking_block = False
+                thinking_content = []
+                thinking_started = False
+
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        current_event = None
+                        continue
+
+                    # 解析事件类型
+                    if line.startswith("event:"):
+                        current_event = line[len("event:"):].strip()
+                        continue
+
+                    # 处理数据行
+                    elif line.startswith("data:"):
+                        json_str = line[len("data:"):].strip()
+                        try:
+                            data = json.loads(json_str)
+
+                            # 处理消息事件
+                            if current_event == "message":
+                                content = data.get("content", "")
+                                timestamp = data.get("timestamp", "")
+                                created = int(timestamp) // 1000 if timestamp else int(time.time())
+                                sse_id = data.get('sseId', str(uuid.uuid4()))
+
+                                # 检查是否是思考块的开始
+                                if "```ys_think" in content and not thinking_started:
+                                    thinking_started = True
+                                    in_thinking_block = True
+                                    # 发送思考块开始标记
+                                    start_chunk = {
+                                        "id": f"chatcmpl-{sse_id}",
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": Config.DEFAULT_MODEL,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {
+                                                "content": "<think>\n\n" if not is_first_chunk else {
+                                                    "role": "assistant",
+                                                    "content": "<think>\n\n"
+                                                }
+                                            },
+                                            "finish_reason": None
+                                        }]
+                                    }
+                                    is_first_chunk = False
+                                    yield f"data: {json.dumps(start_chunk, ensure_ascii=False)}\n\n"
+                                    continue
+
+                                # 检查是否是思考块的结束
+                                if "```" in content and in_thinking_block:
+                                    in_thinking_block = False
+                                    # 发送思考块结束标记
+                                    end_chunk = {
+                                        "id": f"chatcmpl-{sse_id}",
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": Config.DEFAULT_MODEL,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {
+                                                "content": "\n</think>\n\n"
+                                            },
+                                            "finish_reason": None
+                                        }]
+                                    }
+                                    yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+                                    continue
+
+                                # 如果在思考块内，收集思考内容
+                                if in_thinking_block:
+                                    thinking_content.append(content)
+                                    # 在思考块内也发送内容，但标记为思考内容
+                                    chunk = {
+                                        "id": f"chatcmpl-{sse_id}",
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": Config.DEFAULT_MODEL,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {
+                                                "content": content
+                                            },
+                                            "finish_reason": None
+                                        }]
+                                    }
+                                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                    continue
+
+                                # 清理内容，移除思考块
+                                content = clean_thinking_content(content)
+                                if not content:  # 如果清理后内容为空，跳过
+                                    continue
+
+                                # 正常发送内容
+                                chunk = {
+                                    "id": f"chatcmpl-{sse_id}",
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": Config.DEFAULT_MODEL,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "content": content
+                                        } if not is_first_chunk else {
+                                            "role": "assistant",
+                                            "content": content
+                                        },
+                                        "finish_reason": None
+                                    }]
+                                }
+                                is_first_chunk = False
+                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+                            # 处理生成结束事件
+                            elif current_event == "generateEnd":
+                                timestamp = data.get("timestamp", "")
+                                created = int(timestamp) // 1000 if timestamp else int(time.time())
+                                sse_id = data.get('sseId', str(uuid.uuid4()))
+
+                                # 如果思考块还没有结束，发送结束标记
+                                if in_thinking_block:
+                                    end_thinking_chunk = {
+                                        "id": f"chatcmpl-{sse_id}",
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": Config.DEFAULT_MODEL,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {
+                                                "content": "\n</think>\n\n"
+                                            },
+                                            "finish_reason": None
+                                        }]
+                                    }
+                                    yield f"data: {json.dumps(end_thinking_chunk, ensure_ascii=False)}\n\n"
+                                    in_thinking_block = False
+
+                                # 添加元数据
+                                meta_chunk = {
+                                    "id": f"chatcmpl-{sse_id}",
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": Config.DEFAULT_MODEL,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {
+                                            "meta": {
+                                                "thinking_content": "".join(
+                                                    thinking_content) if thinking_content else None
+                                            }
+                                        },
+                                        "finish_reason": None
+                                    }]
+                                }
+                                yield f"data: {json.dumps(meta_chunk, ensure_ascii=False)}\n\n"
+
+                                # 发送结束标记
+                                end_chunk = {
+                                    "id": f"chatcmpl-{sse_id}",
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": Config.DEFAULT_MODEL,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "stop"
+                                    }]
+                                }
+                                yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
+                                yield "data: [DONE]\n\n"
+
+                        except json.JSONDecodeError as e:
+                            logger.error(f"JSON解析错误: {e}")
+                            continue
 
     except httpx.RequestError as e:
         logger.error(f"生成响应错误: {e}")
@@ -569,14 +572,21 @@ async def list_models():
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(request: ChatCompletionRequest, authorization: str = Header(None)):
     """处理聊天完成请求"""
+    # 验证 API 密钥
+    await verify_api_key(authorization)
+
+    # 添加请求日志
+    logger.info(f"Received chat request: {request.model_dump()}")
+
     messages = [msg.model_dump() for msg in request.messages]
 
     if not request.stream:
         # 非流式响应处理
         content = ""
-        thinking_content = []
+        thinking_content = ""
+        meta = None
         in_thinking = False
 
         async for chunk_str in generate_response(
@@ -607,24 +617,28 @@ async def chat_completions(request: ChatCompletionRequest):
 
                             # 收集内容
                             if in_thinking:
-                                thinking_content.append(content_part)
+                                thinking_content += content_part
                             else:
                                 content += content_part
+
+                        # 收集元数据
+                        if "meta" in delta:
+                            meta = delta["meta"]
             except Exception as e:
                 logger.error(f"处理非流式响应错误: {e}")
 
         # 构建完整响应
         return {
-            "id": f"chatcmpl-{uuid.uuid4()}",
+            "id": str(uuid.uuid4()),
             "object": "chat.completion",
             "created": int(time.time()),
             "model": request.model,
             "choices": [{
-                "index": 0,
                 "message": {
                     "role": "assistant",
+                    "reasoning_content": f"<think>\n{thinking_content}\n</think>" if thinking_content else None,
                     "content": content,
-                    "reasoning_content": f"<think>\n{''.join(thinking_content)}\n</think>" if thinking_content else None
+                    "meta": meta
                 },
                 "finish_reason": "stop"
             }]
